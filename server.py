@@ -10,12 +10,15 @@ Provides:
 import os
 import uuid
 import json
-from datetime import datetime, timezone
+from datetime import datetime, timezone, timedelta
 from typing import Annotated, Any, Optional
 
 from bson import ObjectId
 from dotenv import load_dotenv
-from fastapi import FastAPI, HTTPException, APIRouter, status, UploadFile, File
+from fastapi import FastAPI, HTTPException, APIRouter, status, UploadFile, File, Depends, WebSocket, WebSocketDisconnect
+from fastapi.security import HTTPBearer, HTTPAuthorizationCredentials
+import jwt
+from passlib.context import CryptContext
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.middleware.gzip import GZipMiddleware
 from fastapi.responses import StreamingResponse, FileResponse, RedirectResponse
@@ -42,7 +45,12 @@ MONGO_URL = os.environ.get("MONGO_URL", "mock")
 DB_NAME = os.environ.get("DB_NAME", "novashields")
 CORS_ORIGINS = os.environ.get("CORS_ORIGINS", "*").split(",")
 EMERGENT_LLM_KEY = os.environ.get("EMERGENT_LLM_KEY", "")
+JWT_SECRET = os.environ.get("JWT_SECRET", "super-secret-nova-key")
+ALGORITHM = "HS256"
+ACCESS_TOKEN_EXPIRE_MINUTES = 60 * 24 * 7  # 1 week
 
+pwd_context = CryptContext(schemes=["bcrypt"], deprecated="auto")
+security = HTTPBearer()
 if MONGO_URL == "mock":
     class MockCursor:
         def __init__(self, docs):
@@ -248,6 +256,56 @@ def now_iso() -> str:
 # ---------------------------------------------------------------------------
 # Models
 # ---------------------------------------------------------------------------
+class User(BaseDoc):
+    user_id: str = Field(default_factory=lambda: str(uuid.uuid4()))
+    email: str
+    hashed_password: str
+    name: str
+    created_at: str = Field(default_factory=now_iso)
+
+class UserRegister(BaseModel):
+    email: str
+    password: str
+    name: str
+
+class UserLogin(BaseModel):
+    email: str
+    password: str
+
+class Token(BaseModel):
+    access_token: str
+    token_type: str
+    user_id: str
+    name: str
+
+# ---- Security Utilities ----
+def verify_password(plain_password, hashed_password):
+    return pwd_context.verify(plain_password, hashed_password)
+
+def get_password_hash(password):
+    return pwd_context.hash(password)
+
+def create_access_token(data: dict, expires_delta: Optional[timedelta] = None):
+    to_encode = data.copy()
+    if expires_delta:
+        expire = datetime.now(timezone.utc) + expires_delta
+    else:
+        expire = datetime.now(timezone.utc) + timedelta(minutes=15)
+    to_encode.update({"exp": expire})
+    encoded_jwt = jwt.encode(to_encode, JWT_SECRET, algorithm=ALGORITHM)
+    return encoded_jwt
+
+async def get_current_user(credentials: HTTPAuthorizationCredentials = Depends(security)):
+    token = credentials.credentials
+    try:
+        payload = jwt.decode(token, JWT_SECRET, algorithms=[ALGORITHM])
+        user_id: str = payload.get("sub")
+        if user_id is None:
+            raise HTTPException(status_code=401, detail="Invalid token")
+        return user_id
+    except jwt.PyJWTError:
+        raise HTTPException(status_code=401, detail="Invalid or expired token")
+
 class EmergencyContact(BaseDoc):
     contact_id: str = Field(default_factory=lambda: str(uuid.uuid4()))
     user_id: str = "default"
@@ -467,10 +525,94 @@ async def ai_analyze(t: TelemetryFrame, rule: RuleResult) -> dict:
 
 
 # ---------------------------------------------------------------------------
-# FastAPI app
+# FastAPI app & WebSocket Manager
 # ---------------------------------------------------------------------------
 app = FastAPI(title="NovaShields Mobile SOS Backend", version="1.0.0")
 api = APIRouter(prefix="/api")
+
+class IoTConnectionManager:
+    def __init__(self):
+        self.active_devices: dict[str, WebSocket] = {}
+        self.camera_viewers: dict[str, list[WebSocket]] = {}
+        self.camera_sources: dict[str, WebSocket] = {}
+
+    async def connect_device(self, websocket: WebSocket, device_id: str):
+        await websocket.accept()
+        self.active_devices[device_id] = websocket
+
+    def disconnect_device(self, device_id: str):
+        if device_id in self.active_devices:
+            del self.active_devices[device_id]
+
+    async def send_command(self, device_id: str, command: dict):
+        if device_id in self.active_devices:
+            await self.active_devices[device_id].send_json(command)
+
+    async def connect_camera_source(self, websocket: WebSocket, device_id: str):
+        await websocket.accept()
+        self.camera_sources[device_id] = websocket
+
+    def disconnect_camera_source(self, device_id: str):
+        if device_id in self.camera_sources:
+            del self.camera_sources[device_id]
+
+    async def connect_viewer(self, websocket: WebSocket, device_id: str):
+        await websocket.accept()
+        if device_id not in self.camera_viewers:
+            self.camera_viewers[device_id] = []
+        self.camera_viewers[device_id].append(websocket)
+
+    def disconnect_viewer(self, websocket: WebSocket, device_id: str):
+        if device_id in self.camera_viewers:
+            if websocket in self.camera_viewers[device_id]:
+                self.camera_viewers[device_id].remove(websocket)
+
+    async def broadcast_frame(self, device_id: str, frame_bytes: bytes):
+        if device_id in self.camera_viewers:
+            dead_sockets = []
+            for viewer in self.camera_viewers[device_id]:
+                try:
+                    await viewer.send_bytes(frame_bytes)
+                except Exception:
+                    dead_sockets.append(viewer)
+            for dead in dead_sockets:
+                self.disconnect_viewer(dead, device_id)
+
+iot_manager = IoTConnectionManager()
+
+@app.websocket("/ws/telemetry/{device_id}")
+async def ws_telemetry(websocket: WebSocket, device_id: str):
+    await iot_manager.connect_device(websocket, device_id)
+    try:
+        while True:
+            data = await websocket.receive_text()
+            if data.strip() == "FALSE_ALARM":
+                await db.alerts.insert_one({"device_id": device_id, "status": "false_alarm", "timestamp": now_iso()})
+            elif data.strip() == "CONFIRMED_ACCIDENT":
+                await db.alerts.insert_one({"device_id": device_id, "status": "confirmed_accident", "timestamp": now_iso()})
+                if device_id in iot_manager.camera_sources:
+                    await iot_manager.camera_sources[device_id].send_text("WAKE_UP")
+    except WebSocketDisconnect:
+        iot_manager.disconnect_device(device_id)
+
+@app.websocket("/ws/camera/stream/{device_id}")
+async def ws_camera_stream(websocket: WebSocket, device_id: str):
+    await iot_manager.connect_camera_source(websocket, device_id)
+    try:
+        while True:
+            frame_bytes = await websocket.receive_bytes()
+            await iot_manager.broadcast_frame(device_id, frame_bytes)
+    except WebSocketDisconnect:
+        iot_manager.disconnect_camera_source(device_id)
+
+@app.websocket("/ws/camera/view/{device_id}")
+async def ws_camera_view(websocket: WebSocket, device_id: str):
+    await iot_manager.connect_viewer(websocket, device_id)
+    try:
+        while True:
+            await websocket.receive_text()
+    except WebSocketDisconnect:
+        iot_manager.disconnect_viewer(websocket, device_id)
 
 app.add_middleware(GZipMiddleware, minimum_size=1000)
 app.add_middleware(
@@ -487,16 +629,45 @@ async def health():
     return {"status": "online", "service": "NovaShields Mobile SOS", "time": now_iso()}
 
 
+# ---- Auth Endpoints -------------------------------------------------------
+@api.post("/auth/register")
+async def register(user_in: UserRegister):
+    existing = await db.users.find_one({"email": user_in.email})
+    if existing:
+        raise HTTPException(status_code=400, detail="Email already registered")
+    
+    hashed_password = get_password_hash(user_in.password)
+    new_user = User(
+        email=user_in.email,
+        hashed_password=hashed_password,
+        name=user_in.name
+    )
+    result = await db.users.insert_one(new_user.model_dump(exclude={"id"}))
+    return {"message": "User registered successfully", "user_id": str(result.inserted_id)}
+
+@api.post("/auth/login")
+async def login(user_in: UserLogin):
+    user = await db.users.find_one({"email": user_in.email})
+    if not user or not verify_password(user_in.password, user["hashed_password"]):
+        raise HTTPException(status_code=401, detail="Incorrect email or password")
+    
+    access_token_expires = timedelta(minutes=ACCESS_TOKEN_EXPIRE_MINUTES)
+    access_token = create_access_token(
+        data={"sub": user["user_id"]}, expires_delta=access_token_expires
+    )
+    return {"access_token": access_token, "token_type": "bearer", "user_id": user["user_id"], "name": user["name"]}
+
+
 # ---- Emergency Contacts CRUD ----------------------------------------------
 @api.get("/contacts")
-async def list_contacts(user_id: str = "default"):
+async def list_contacts(user_id: str = Depends(get_current_user)):
     cursor = db.contacts.find({"user_id": user_id}).sort("priority", 1)
     docs = await cursor.to_list(length=100)
     return [EmergencyContact.from_mongo(d).model_dump() for d in docs]
 
 
 @api.post("/contacts", status_code=status.HTTP_201_CREATED)
-async def add_contact(body: EmergencyContactIn, user_id: str = "default"):
+async def add_contact(body: EmergencyContactIn, user_id: str = Depends(get_current_user)):
     doc = EmergencyContact(user_id=user_id, **body.model_dump()).model_dump(exclude={"id"})
     result = await db.contacts.insert_one(doc)
     doc["_id"] = str(result.inserted_id)
@@ -735,7 +906,7 @@ async def end_trip(trip_id: str):
 
 
 @api.get("/trips")
-async def list_trips(user_id: str = "default", limit: int = 30):
+async def list_trips(user_id: str = Depends(get_current_user), limit: int = 30):
     cur = db.trips.find({"user_id": user_id}).sort("started_at", -1).limit(limit)
     docs = await cur.to_list(length=limit)
     out = []

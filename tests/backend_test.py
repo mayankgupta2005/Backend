@@ -27,6 +27,14 @@ API = f"{BASE_URL.rstrip('/')}/api"
 def session():
     s = requests.Session()
     s.headers.update({"Content-Type": "application/json"})
+    try:
+        s.post(f"{API}/auth/register", json={"name": "Test", "email": "test@nova.com", "password": "password"})
+        r = s.post(f"{API}/auth/login", json={"email": "test@nova.com", "password": "password"})
+        if r.status_code == 200:
+            token = r.json().get("access_token")
+            s.headers.update({"Authorization": f"Bearer {token}"})
+    except Exception:
+        pass
     return s
 
 
