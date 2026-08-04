@@ -7,12 +7,12 @@ services:
     startCommand: uvicorn server:app --host 0.0.0.0 --port $PORT
     envVars:
       - key: MONGO_URL
-        placeholder: "Enter MongoDB connection URI or 'mock' to run mock DB"
+        sync: false
       - key: DB_NAME
         value: novashields
       - key: CORS_ORIGINS
         value: "*"
       - key: EMERGENT_LLM_KEY
-        placeholder: "Enter Claude Anthropic LLM API Key (optional)"
+        sync: false
       - key: FIREBASE_SERVICE_ACCOUNT_PATH
-        placeholder: "Enter Firebase service account json path (optional)"
+        sync: false
