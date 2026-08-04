@@ -10,6 +10,7 @@ Provides:
 import os
 import uuid
 import json
+import collections
 from datetime import datetime, timezone, timedelta
 from typing import Annotated, Any, Optional
 
@@ -535,6 +536,33 @@ class IoTConnectionManager:
         self.active_devices: dict[str, WebSocket] = {}
         self.camera_viewers: dict[str, list[WebSocket]] = {}
         self.camera_sources: dict[str, WebSocket] = {}
+        self.telemetry_buffer: dict[str, collections.deque] = {}
+        self.video_buffer: dict[str, collections.deque] = {}
+
+    def init_buffers(self, device_id: str):
+        if device_id not in self.telemetry_buffer:
+            self.telemetry_buffer[device_id] = collections.deque(maxlen=300) # 30s @ 10Hz
+        if device_id not in self.video_buffer:
+            self.video_buffer[device_id] = collections.deque(maxlen=300)
+
+    def add_telemetry(self, device_id: str, data: str):
+        self.init_buffers(device_id)
+        self.telemetry_buffer[device_id].append({"ts": now_iso(), "data": data})
+
+    def add_video_frame(self, device_id: str, frame: bytes):
+        self.init_buffers(device_id)
+        self.video_buffer[device_id].append({"ts": now_iso(), "frame": frame})
+
+    async def save_snapshot(self, device_id: str):
+        self.init_buffers(device_id)
+        telemetry = list(self.telemetry_buffer[device_id])
+        snapshot = {
+            "device_id": device_id,
+            "timestamp": now_iso(),
+            "telemetry_history": telemetry,
+            "video_frames_count": len(self.video_buffer[device_id])
+        }
+        await db.blackbox_snapshots.insert_one(snapshot)
 
     async def connect_device(self, websocket: WebSocket, device_id: str):
         await websocket.accept()
@@ -590,8 +618,12 @@ async def ws_telemetry(websocket: WebSocket, device_id: str):
                 await db.alerts.insert_one({"device_id": device_id, "status": "false_alarm", "timestamp": now_iso()})
             elif data.strip() == "CONFIRMED_ACCIDENT":
                 await db.alerts.insert_one({"device_id": device_id, "status": "confirmed_accident", "timestamp": now_iso()})
+                await iot_manager.save_snapshot(device_id)
                 if device_id in iot_manager.camera_sources:
                     await iot_manager.camera_sources[device_id].send_text("WAKE_UP")
+            else:
+                # Buffer the normal telemetry data
+                iot_manager.add_telemetry(device_id, data)
     except WebSocketDisconnect:
         iot_manager.disconnect_device(device_id)
 
@@ -601,6 +633,7 @@ async def ws_camera_stream(websocket: WebSocket, device_id: str):
     try:
         while True:
             frame_bytes = await websocket.receive_bytes()
+            iot_manager.add_video_frame(device_id, frame_bytes)
             await iot_manager.broadcast_frame(device_id, frame_bytes)
     except WebSocketDisconnect:
         iot_manager.disconnect_camera_source(device_id)
