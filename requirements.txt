@@ -1,0 +1,12 @@
+fastapi==0.115.6
+uvicorn[standard]==0.34.0
+pydantic==2.10.3
+python-dotenv==1.0.1
+motor==3.6.0
+pymongo==4.9.2
+scikit-learn==1.9.0
+pandas==3.0.5
+joblib==1.5.3
+numpy
+python-multipart==0.0.20
+reportlab==5.0.0
