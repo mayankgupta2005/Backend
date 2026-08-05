@@ -16,6 +16,8 @@ from typing import Annotated, Any, Optional
 
 from bson import ObjectId
 from dotenv import load_dotenv
+import cloudinary
+import cloudinary.uploader
 from fastapi import FastAPI, HTTPException, APIRouter, status, UploadFile, File, Depends, WebSocket, WebSocketDisconnect
 from fastapi.security import HTTPBearer, HTTPAuthorizationCredentials
 import jwt
@@ -49,6 +51,19 @@ EMERGENT_LLM_KEY = os.environ.get("EMERGENT_LLM_KEY", "")
 JWT_SECRET = os.environ.get("JWT_SECRET", "super-secret-nova-key")
 ALGORITHM = "HS256"
 ACCESS_TOKEN_EXPIRE_MINUTES = 60 * 24 * 7  # 1 week
+
+CLOUDINARY_CLOUD_NAME = os.environ.get("CLOUDINARY_CLOUD_NAME", "")
+CLOUDINARY_API_KEY = os.environ.get("CLOUDINARY_API_KEY", "")
+CLOUDINARY_API_SECRET = os.environ.get("CLOUDINARY_API_SECRET", "")
+
+if CLOUDINARY_CLOUD_NAME and CLOUDINARY_API_KEY and CLOUDINARY_API_SECRET:
+    cloudinary.config(
+        cloud_name=CLOUDINARY_CLOUD_NAME,
+        api_key=CLOUDINARY_API_KEY,
+        api_secret=CLOUDINARY_API_SECRET,
+        secure=True
+    )
+
 
 pwd_context = CryptContext(schemes=["bcrypt"], deprecated="auto")
 security = HTTPBearer()
@@ -307,7 +322,15 @@ async def get_current_user(credentials: HTTPAuthorizationCredentials = Depends(s
     except jwt.PyJWTError:
         raise HTTPException(status_code=401, detail="Invalid or expired token")
 
+class CameraCapture(BaseDoc):
+    capture_id: str = Field(default_factory=lambda: str(uuid.uuid4()))
+    device_id: str = "device_001"
+    image_url: str
+    created_at: str = Field(default_factory=now_iso)
+
+
 class EmergencyContact(BaseDoc):
+
     contact_id: str = Field(default_factory=lambda: str(uuid.uuid4()))
     user_id: str = "default"
     name: str
@@ -730,6 +753,51 @@ async def create_alert(body: AlertIn):
     result = await db.alerts.insert_one(doc)
     doc["_id"] = str(result.inserted_id)
     return AlertRecord.from_mongo(doc).model_dump()
+
+
+# ---- ESP32 Camera Endpoints -----------------------------------------------
+@api.post("/camera/upload", status_code=status.HTTP_201_CREATED)
+async def upload_camera_image(device_id: str = "device_001", file: UploadFile = File(...)):
+    if not CLOUDINARY_CLOUD_NAME or not CLOUDINARY_API_KEY or not CLOUDINARY_API_SECRET:
+        raise HTTPException(
+            status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
+            detail="Cloudinary credentials are not configured on the server."
+        )
+    
+    try:
+        # Upload the file directly using Cloudinary
+        upload_result = cloudinary.uploader.upload(
+            file.file,
+            folder="novashields_esp32"
+        )
+        image_url = upload_result.get("secure_url")
+        if not image_url:
+            raise Exception("Secure URL not returned by Cloudinary.")
+    except Exception as e:
+        raise HTTPException(
+            status_code=status.HTTP_502_BAD_GATEWAY,
+            detail=f"Cloudinary upload error: {str(e)}"
+        )
+    
+    doc = CameraCapture(device_id=device_id, image_url=image_url).model_dump(exclude={"id"})
+    result = await db.camera_captures.insert_one(doc)
+    doc["_id"] = str(result.inserted_id)
+    return CameraCapture.from_mongo(doc).model_dump()
+
+
+@api.get("/camera/latest/{device_id}")
+async def get_latest_image(device_id: str):
+    capture = await db.camera_captures.find_one(
+        {"device_id": device_id},
+        sort=[("created_at", -1)]
+    )
+    if not capture:
+        raise HTTPException(
+            status_code=status.HTTP_404_NOT_FOUND,
+            detail=f"No image captures found for device {device_id}."
+        )
+    return CameraCapture.from_mongo(capture).model_dump()
+
 
 
 # ---- Command Log ----------------------------------------------------------
