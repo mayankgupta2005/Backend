@@ -44,7 +44,10 @@ load_dotenv()
 # ---------------------------------------------------------------------------
 # Configuration / Database Mock Client
 # ---------------------------------------------------------------------------
-MONGO_URL = os.environ.get("MONGO_URL", "mock")
+MONGO_URL = os.environ.get("MONGO_URL")
+if not MONGO_URL or MONGO_URL == "mock":
+    raise ValueError("Real-time DB required! Set MONGO_URL environment variable.")
+    
 DB_NAME = os.environ.get("DB_NAME", "novashields")
 CORS_ORIGINS = os.environ.get("CORS_ORIGINS", "*").split(",")
 EMERGENT_LLM_KEY = os.environ.get("EMERGENT_LLM_KEY", "")
@@ -67,179 +70,9 @@ if CLOUDINARY_CLOUD_NAME and CLOUDINARY_API_KEY and CLOUDINARY_API_SECRET:
 
 pwd_context = CryptContext(schemes=["bcrypt"], deprecated="auto")
 security = HTTPBearer()
-if MONGO_URL == "mock":
-    class MockCursor:
-        def __init__(self, docs):
-            self.docs = docs
-            self._sort_key = None
-            self._sort_dir = 1
-            self._limit = None
 
-        def sort(self, key, direction=1):
-            self._sort_key = key
-            self._sort_dir = direction
-            return self
-
-        def limit(self, n):
-            self._limit = n
-            return self
-
-        async def to_list(self, length=None):
-            docs = list(self.docs)
-            if self._sort_key:
-                reverse = (self._sort_dir == -1)
-                docs.sort(key=lambda x: x.get(self._sort_key, ""), reverse=reverse)
-            if self._limit is not None:
-                docs = docs[:self._limit]
-            elif length is not None:
-                docs = docs[:length]
-            return docs
-
-    class MockInsertResult:
-        def __init__(self, inserted_id):
-            self.inserted_id = inserted_id
-
-    class MockDeleteResult:
-        def __init__(self, deleted_count):
-            self.deleted_count = deleted_count
-
-    class MockUpdateResult:
-        def __init__(self, modified_count, upserted_id=None, matched_count=1):
-            self.modified_count = modified_count
-            self.upserted_id = upserted_id
-            self.matched_count = matched_count
-
-    class MockCollection:
-        def __init__(self, name):
-            self.name = name
-            self.data = []
-
-        def find(self, query=None, projection=None):
-            query = query or {}
-            results = []
-            for doc in self.data:
-                match = True
-                for k, v in query.items():
-                    if doc.get(k) != v:
-                        match = False
-                        break
-                if match:
-                    results.append(doc)
-            return MockCursor(results)
-
-        async def find_one(self, query=None, projection=None, sort=None, **kwargs):
-            query = query or {}
-            results = []
-            for doc in self.data:
-                match = True
-                for k, v in query.items():
-                    if doc.get(k) != v:
-                        match = False
-                        break
-                if match:
-                    results.append(doc)
-            if not results:
-                return None
-            if sort:
-                for key, direction in reversed(sort):
-                    reverse = (direction == -1)
-                    results.sort(key=lambda x: x.get(key, ""), reverse=reverse)
-            return results[0]
-
-        async def insert_one(self, doc):
-            import copy
-            doc_copy = copy.deepcopy(doc)
-            if "_id" not in doc_copy:
-                doc_copy["_id"] = str(uuid.uuid4())
-            self.data.append(doc_copy)
-            return MockInsertResult(doc_copy["_id"])
-
-        async def update_one(self, query, update, upsert=False):
-            match_doc = None
-            for doc in self.data:
-                match = True
-                for k, v in query.items():
-                    if doc.get(k) != v:
-                        match = False
-                        break
-                if match:
-                    match_doc = doc
-                    break
-
-            if not match_doc:
-                if upsert:
-                    import copy
-                    new_doc = copy.deepcopy(query)
-                    if "_id" not in new_doc:
-                        new_doc["_id"] = str(uuid.uuid4())
-                    if "$set" in update:
-                        new_doc.update(update["$set"])
-                    if "$push" in update:
-                        for k, v in update["$push"].items():
-                            new_doc[k] = [v]
-                    if "$inc" in update:
-                        for k, v in update["$inc"].items():
-                            new_doc[k] = float(v)
-                    if "$max" in update:
-                        for k, v in update["$max"].items():
-                            new_doc[k] = v
-                    self.data.append(new_doc)
-                    return MockUpdateResult(0, new_doc["_id"], matched_count=0)
-                else:
-                    return MockUpdateResult(0, matched_count=0)
-
-            if "$set" in update:
-                match_doc.update(update["$set"])
-            if "$push" in update:
-                for k, v in update["$push"].items():
-                    if k not in match_doc or not isinstance(match_doc[k], list):
-                        match_doc[k] = []
-                    match_doc[k].append(v)
-            if "$inc" in update:
-                for k, v in update["$inc"].items():
-                    if k not in match_doc:
-                        match_doc[k] = 0.0
-                    match_doc[k] += float(v)
-            if "$max" in update:
-                for k, v in update["$max"].items():
-                    if k not in match_doc:
-                        match_doc[k] = v
-                    else:
-                        match_doc[k] = max(match_doc[k], v)
-            return MockUpdateResult(1, matched_count=1)
-
-        async def delete_one(self, query):
-            initial_len = len(self.data)
-            self.data = [doc for doc in self.data if not all(doc.get(k) == v for k, v in query.items())]
-            deleted = initial_len - len(self.data)
-            return MockDeleteResult(deleted)
-
-    class MockDatabase:
-        def __init__(self):
-            self._collections = {}
-
-        def __getattr__(self, name):
-            if name not in self._collections:
-                self._collections[name] = MockCollection(name)
-            return self._collections[name]
-
-        def __getitem__(self, name):
-            return self.__getattr__(name)
-
-    class MockMotorClient:
-        def __init__(self, uri=None):
-            self._databases = {}
-
-        def __getitem__(self, name):
-            if name not in self._databases:
-                self._databases[name] = MockDatabase()
-            return self._databases[name]
-
-    client = MockMotorClient()
-    db = client[DB_NAME]
-else:
-    client = AsyncIOMotorClient(MONGO_URL)
-    db = client[DB_NAME]
+client = AsyncIOMotorClient(MONGO_URL)
+db = client[DB_NAME]
 
 # ---------------------------------------------------------------------------
 # Mongo helpers (ObjectId-safe)
