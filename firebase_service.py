@@ -38,7 +38,7 @@ def init_firebase():
         _firebase_initialized = True
         logger.info("Firebase Admin SDK initialized successfully for RTDB.")
     except Exception as e:
-        logger.error(f"Failed to initialize Firebase Admin SDK: {e}")
+        logger.error("Failed to initialize Firebase Admin SDK. Check credentials and configuration.")
 
 def _set_node(path: str, data: dict):
     init_firebase()

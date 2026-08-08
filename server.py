@@ -21,7 +21,8 @@ import cloudinary.uploader
 from fastapi import FastAPI, HTTPException, APIRouter, status, UploadFile, File, Depends, WebSocket, WebSocketDisconnect
 from fastapi.security import HTTPBearer, HTTPAuthorizationCredentials
 import jwt
-from passlib.context import CryptContext
+import bcrypt
+from contextlib import asynccontextmanager
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.middleware.gzip import GZipMiddleware
 from fastapi.responses import StreamingResponse, FileResponse, RedirectResponse
@@ -52,7 +53,9 @@ if not MONGO_URL or MONGO_URL == "mock":
 DB_NAME = os.environ.get("DB_NAME", "novashields")
 CORS_ORIGINS = os.environ.get("CORS_ORIGINS", "*").split(",")
 EMERGENT_LLM_KEY = os.environ.get("EMERGENT_LLM_KEY", "")
-JWT_SECRET = os.environ.get("JWT_SECRET", "super-secret-nova-key")
+JWT_SECRET = os.environ.get("JWT_SECRET")
+if not JWT_SECRET:
+    raise ValueError("JWT_SECRET environment variable is required!")
 ALGORITHM = "HS256"
 ACCESS_TOKEN_EXPIRE_MINUTES = 60 * 24 * 7  # 1 week
 
@@ -69,7 +72,7 @@ if CLOUDINARY_CLOUD_NAME and CLOUDINARY_API_KEY and CLOUDINARY_API_SECRET:
     )
 
 
-pwd_context = CryptContext(schemes=["bcrypt"], deprecated="auto")
+
 security = HTTPBearer()
 
 client = AsyncIOMotorClient(MONGO_URL)
@@ -129,11 +132,11 @@ class Token(BaseModel):
     name: str
 
 # ---- Security Utilities ----
-def verify_password(plain_password, hashed_password):
-    return pwd_context.verify(plain_password, hashed_password)
+def verify_password(plain_password: str, hashed_password: str):
+    return bcrypt.checkpw(plain_password.encode('utf-8'), hashed_password.encode('utf-8'))
 
-def get_password_hash(password):
-    return pwd_context.hash(password)
+def get_password_hash(password: str):
+    return bcrypt.hashpw(password.encode('utf-8'), bcrypt.gensalt()).decode('utf-8')
 
 def create_access_token(data: dict, expires_delta: Optional[timedelta] = None):
     to_encode = data.copy()
@@ -385,7 +388,15 @@ async def ai_analyze(t: TelemetryFrame, rule: RuleResult) -> dict:
 # ---------------------------------------------------------------------------
 # FastAPI app & WebSocket Manager
 # ---------------------------------------------------------------------------
-app = FastAPI(title="NovaShields Mobile SOS Backend", version="1.0.0")
+@asynccontextmanager
+async def lifespan(app: FastAPI):
+    try:
+        await client.admin.command('ping')
+    except Exception:
+        raise RuntimeError("Could not connect to database")
+    yield
+
+app = FastAPI(title="NovaShields Mobile SOS Backend", version="1.0.0", lifespan=lifespan)
 api = APIRouter(prefix="/api")
 
 class IoTConnectionManager:
@@ -476,8 +487,10 @@ async def ws_telemetry(websocket: WebSocket, device_id: str):
             data = await websocket.receive_text()
             if data.strip() == "FALSE_ALARM":
                 await db.alerts.insert_one({"device_id": device_id, "status": "false_alarm", "timestamp": now_iso()})
+                firebase_service.update_accident_status(device_id, {"status": "normal", "timestamp": now_iso()})
             elif data.strip() == "CONFIRMED_ACCIDENT":
                 await db.alerts.insert_one({"device_id": device_id, "status": "confirmed_accident", "timestamp": now_iso()})
+                firebase_service.update_accident_status(device_id, {"status": "confirmed_accident", "timestamp": now_iso()})
                 await iot_manager.save_snapshot(device_id)
                 if device_id in iot_manager.camera_sources:
                     await iot_manager.camera_sources[device_id].send_text("WAKE_UP")
@@ -656,6 +669,7 @@ async def log_command(body: CommandIn):
     doc = CommandLog(**body.model_dump()).model_dump(exclude={"id"})
     result = await db.commands.insert_one(doc)
     doc["_id"] = str(result.inserted_id)
+    await iot_manager.send_command(body.device_id, body.model_dump())
     return CommandLog.from_mongo(doc).model_dump()
 
 
