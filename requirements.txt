@@ -14,3 +14,4 @@ PyJWT==2.10.1
 passlib[bcrypt]==1.7.4
 websockets==14.1
 cloudinary>=1.36.0
+firebase-admin>=6.3.0

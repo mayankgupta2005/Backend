@@ -21,3 +21,4 @@ env/
 # Local database / test artifacts
 *.pdf
 *.log
+firebase-adminsdk.json

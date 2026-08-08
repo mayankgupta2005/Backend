@@ -40,6 +40,7 @@ from ml import (
 )
 
 load_dotenv()
+import firebase_service
 
 # ---------------------------------------------------------------------------
 # Configuration / Database Mock Client
@@ -423,14 +424,17 @@ class IoTConnectionManager:
     async def connect_device(self, websocket: WebSocket, device_id: str):
         await websocket.accept()
         self.active_devices[device_id] = websocket
+        firebase_service.update_device_status(device_id, {"is_online": True, "last_seen": now_iso()})
 
     def disconnect_device(self, device_id: str):
         if device_id in self.active_devices:
             del self.active_devices[device_id]
+            firebase_service.update_device_status(device_id, {"is_online": False, "last_seen": now_iso()})
 
     async def send_command(self, device_id: str, command: dict):
         if device_id in self.active_devices:
             await self.active_devices[device_id].send_json(command)
+        firebase_service.push_emergency_command(device_id, {"command": command, "command_timestamp": now_iso()})
 
     async def connect_camera_source(self, websocket: WebSocket, device_id: str):
         await websocket.accept()
@@ -480,6 +484,11 @@ async def ws_telemetry(websocket: WebSocket, device_id: str):
             else:
                 # Buffer the normal telemetry data
                 iot_manager.add_telemetry(device_id, data)
+                try:
+                    telemetry_dict = json.loads(data)
+                    firebase_service.update_live_telemetry(device_id, telemetry_dict)
+                except Exception:
+                    pass
     except WebSocketDisconnect:
         iot_manager.disconnect_device(device_id)
 
@@ -689,41 +698,7 @@ async def analyze(body: AnalyzeIn):
     }
 
 
-# ---- Simulator (for hackathon demo without hardware) ----------------------
-class SimulatorProfile(BaseModel):
-    scenario: str = "cruise"
 
-
-@api.post("/simulate")
-async def simulate(profile: SimulatorProfile):
-    import random
-    lat, lon = 12.9716, 77.5946
-    if profile.scenario == "cruise":
-        t = TelemetryFrame(
-            ax=random.uniform(-0.1, 0.1), ay=random.uniform(-0.1, 0.1),
-            az=1.0 + random.uniform(-0.05, 0.05),
-            gx=random.uniform(-2, 2), gy=random.uniform(-2, 2), gz=random.uniform(-2, 2),
-            speed_kmh=random.uniform(30, 60), latitude=lat, longitude=lon,
-            battery=random.uniform(80, 100),
-            lean_angle=random.uniform(-8, 8), pitch=random.uniform(-3, 3),
-            roll=random.uniform(-5, 5), timestamp=now_iso(),
-        )
-    elif profile.scenario == "hard_brake":
-        t = TelemetryFrame(ax=-1.8, ay=0.2, az=0.9, gx=-5, gy=3, gz=1,
-                           speed_kmh=45, latitude=lat, longitude=lon, battery=88,
-                           lean_angle=5, pitch=-6, roll=2, timestamp=now_iso())
-    elif profile.scenario == "crash":
-        t = TelemetryFrame(ax=2.9, ay=1.8, az=0.5, gx=180, gy=90, gz=45,
-                           speed_kmh=52, latitude=lat, longitude=lon, battery=76,
-                           lean_angle=68, pitch=-45, roll=72, timestamp=now_iso())
-    elif profile.scenario == "freefall":
-        t = TelemetryFrame(ax=0.05, ay=0.05, az=0.1, gx=10, gy=20, gz=15,
-                           speed_kmh=30, latitude=lat, longitude=lon, battery=68,
-                           lean_angle=25, pitch=-20, roll=15, timestamp=now_iso())
-    else:
-        raise HTTPException(400, "Unknown scenario")
-    rule = evaluate_rules(t)
-    return {"telemetry": t.model_dump(), "rule": rule.model_dump()}
 
 
 # ---- Trips ---------------------------------------------------------------
@@ -1354,6 +1329,10 @@ async def legacy_cancel_sos(body: LegacyCancelSOS):
     ).model_dump(exclude={"id"})
     await db.commands.insert_one(doc)
     return {"status": "success", "message": f"SOS cancelled for {body.device_id}"}
+
+
+# ---------------------------------------------------------------------------
+
 
 
 @app.get("/")
