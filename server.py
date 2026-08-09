@@ -6,11 +6,17 @@ Provides:
 - AI crash analysis using Claude Sonnet 4.6 via EMERGENT_LLM_KEY
 - Rule-based crash detection endpoint
 - Simulator endpoints for testing without hardware
+- Multi-device IoT support (Black Box, Alert Module, Camera)
+- Firebase RTDB synchronisation for device commands & state
+- Camera metadata management
 """
 import os
 import uuid
 import json
+import asyncio
 import collections
+import logging
+from enum import Enum
 from datetime import datetime, timezone, timedelta
 from typing import Annotated, Any, Optional
 
@@ -58,10 +64,13 @@ if not JWT_SECRET:
     raise ValueError("JWT_SECRET environment variable is required!")
 ALGORITHM = "HS256"
 ACCESS_TOKEN_EXPIRE_MINUTES = 60 * 24 * 7  # 1 week
+DEVICE_ONLINE_TIMEOUT_SECONDS = int(os.environ.get("DEVICE_ONLINE_TIMEOUT_SECONDS", "60"))
 
 CLOUDINARY_CLOUD_NAME = os.environ.get("CLOUDINARY_CLOUD_NAME", "")
 CLOUDINARY_API_KEY = os.environ.get("CLOUDINARY_API_KEY", "")
 CLOUDINARY_API_SECRET = os.environ.get("CLOUDINARY_API_SECRET", "")
+
+logger = logging.getLogger(__name__)
 
 if CLOUDINARY_CLOUD_NAME and CLOUDINARY_API_KEY and CLOUDINARY_API_SECRET:
     cloudinary.config(
@@ -166,6 +175,69 @@ class CameraCapture(BaseDoc):
     created_at: str = Field(default_factory=now_iso)
 
 
+# ---------------------------------------------------------------------------
+# Device Types & Registration  (NEW — multi-device IoT support)
+# ---------------------------------------------------------------------------
+class DeviceType(str, Enum):
+    BLACKBOX = "BLACKBOX"
+    ALERT_MODULE = "ALERT_MODULE"
+    CAMERA = "CAMERA"
+
+
+class Device(BaseDoc):
+    device_id: str
+    device_type: DeviceType
+    name: str = ""
+    vehicle_id: Optional[str] = None
+    user_id: Optional[str] = None
+    enabled: bool = True
+    is_online: bool = False
+    last_seen: Optional[str] = None
+    created_at: str = Field(default_factory=now_iso)
+
+
+class DeviceRegister(BaseModel):
+    device_id: str
+    device_type: DeviceType
+    name: str = ""
+    vehicle_id: Optional[str] = None
+    user_id: Optional[str] = None
+
+
+class DeviceUpdate(BaseModel):
+    name: Optional[str] = None
+    vehicle_id: Optional[str] = None
+    user_id: Optional[str] = None
+    enabled: Optional[bool] = None
+
+
+# ---------------------------------------------------------------------------
+# Camera Metadata  (NEW — ESP32-CAM stream/snapshot URL management)
+# ---------------------------------------------------------------------------
+class CameraMetadataModel(BaseModel):
+    device_id: str
+    online: bool = False
+    stream_url: Optional[str] = None
+    snapshot_url: Optional[str] = None
+    last_frame_at: Optional[str] = None
+    updated_at: str = Field(default_factory=now_iso)
+
+
+class CameraMetadataIn(BaseModel):
+    online: Optional[bool] = None
+    stream_url: Optional[str] = None
+    snapshot_url: Optional[str] = None
+    last_frame_at: Optional[str] = None
+
+
+# ---------------------------------------------------------------------------
+# Command Acknowledgement  (NEW — device reports execution status)
+# ---------------------------------------------------------------------------
+class CommandAck(BaseModel):
+    status: str  # RECEIVED | EXECUTED | FAILED
+    error: Optional[str] = None
+
+
 class EmergencyContact(BaseDoc):
 
     contact_id: str = Field(default_factory=lambda: str(uuid.uuid4()))
@@ -217,8 +289,11 @@ class CommandLog(BaseDoc):
     device_id: str
     command: str  # buzzer_on, send_sms, make_call, upload_snapshot, reboot, led_on
     payload: dict = {}
-    status: str = "sent"  # sent | ack | timeout
+    status: str = "PENDING"  # PENDING | RECEIVED | EXECUTED | FAILED  (was: sent | ack | timeout)
     created_at: str = Field(default_factory=now_iso)
+    received_at: Optional[str] = None
+    executed_at: Optional[str] = None
+    error: Optional[str] = None
 
 
 class CommandIn(BaseModel):
@@ -404,6 +479,7 @@ class IoTConnectionManager:
         self.active_devices: dict[str, WebSocket] = {}
         self.camera_viewers: dict[str, list[WebSocket]] = {}
         self.camera_sources: dict[str, WebSocket] = {}
+        self.dashboard_viewers: dict[str, list[WebSocket]] = {}  # NEW: dashboard viewers per device
         self.telemetry_buffer: dict[str, collections.deque] = {}
         self.video_buffer: dict[str, collections.deque] = {}
 
@@ -477,6 +553,58 @@ class IoTConnectionManager:
             for dead in dead_sockets:
                 self.disconnect_viewer(dead, device_id)
 
+    # ---- NEW: Dashboard viewer management ----
+    async def connect_dashboard_viewer(self, websocket: WebSocket, device_id: str):
+        await websocket.accept()
+        if device_id not in self.dashboard_viewers:
+            self.dashboard_viewers[device_id] = []
+        self.dashboard_viewers[device_id].append(websocket)
+
+    def disconnect_dashboard_viewer(self, websocket: WebSocket, device_id: str):
+        if device_id in self.dashboard_viewers:
+            if websocket in self.dashboard_viewers[device_id]:
+                self.dashboard_viewers[device_id].remove(websocket)
+
+    async def broadcast_to_dashboard(self, device_id: str, event_type: str, data: dict):
+        """Broadcast a typed JSON event to all dashboard viewers for a device."""
+        message = {
+            "type": event_type,
+            "device_id": device_id,
+            "data": data,
+            "timestamp": now_iso(),
+        }
+        if device_id not in self.dashboard_viewers:
+            return
+        dead_sockets = []
+        for viewer in self.dashboard_viewers[device_id]:
+            try:
+                await viewer.send_json(message)
+            except Exception:
+                dead_sockets.append(viewer)
+        for dead in dead_sockets:
+            self.disconnect_dashboard_viewer(dead, device_id)
+
+    async def broadcast_to_all_dashboards(self, event_type: str, data: dict):
+        """Broadcast an event to ALL dashboard viewers across all devices."""
+        all_device_ids = list(self.dashboard_viewers.keys())
+        for did in all_device_ids:
+            await self.broadcast_to_dashboard(did, event_type, data)
+
+
+async def _find_related_devices(device_id: str, target_type: str) -> list[str]:
+    """Find related devices (e.g. alert module for a given blackbox) by vehicle_id."""
+    source_device = await db.devices.find_one({"device_id": device_id})
+    if not source_device or not source_device.get("vehicle_id"):
+        return []
+    cursor = db.devices.find({
+        "vehicle_id": source_device["vehicle_id"],
+        "device_type": target_type,
+        "enabled": True,
+    })
+    docs = await cursor.to_list(length=10)
+    return [d["device_id"] for d in docs]
+
+
 iot_manager = IoTConnectionManager()
 
 @app.websocket("/ws/telemetry/{device_id}")
@@ -488,22 +616,98 @@ async def ws_telemetry(websocket: WebSocket, device_id: str):
             if data.strip() == "FALSE_ALARM":
                 await db.alerts.insert_one({"device_id": device_id, "status": "false_alarm", "timestamp": now_iso()})
                 firebase_service.update_accident_status(device_id, {"status": "normal", "timestamp": now_iso()})
+                # NEW: Clear alert state on related alert modules
+                try:
+                    alert_modules = await _find_related_devices(device_id, DeviceType.ALERT_MODULE)
+                    for am_id in alert_modules:
+                        cancel_cmd = {
+                            "command": "sos_off",
+                            "command_id": str(uuid.uuid4()),
+                            "status": "PENDING",
+                            "created_at": now_iso(),
+                            "received_at": None,
+                            "executed_at": None,
+                            "error": None,
+                        }
+                        await firebase_service.async_write_device_command(am_id, cancel_cmd)
+                    await firebase_service.async_update_alert_state(device_id, {
+                        "active": False, "alert_type": None, "message": "False alarm — cancelled",
+                        "timestamp": now_iso(), "alert_id": None,
+                    })
+                except Exception as e:
+                    logger.error(f"Error during FALSE_ALARM alert-module update: {e}")
+                # Broadcast to dashboard viewers
+                await iot_manager.broadcast_to_dashboard(device_id, "accident_status", {
+                    "status": "false_alarm", "device_id": device_id,
+                })
             elif data.strip() == "CONFIRMED_ACCIDENT":
-                await db.alerts.insert_one({"device_id": device_id, "status": "confirmed_accident", "timestamp": now_iso()})
+                alert_id = str(uuid.uuid4())
+                await db.alerts.insert_one({
+                    "device_id": device_id, "status": "confirmed_accident",
+                    "alert_id": alert_id, "timestamp": now_iso(),
+                })
                 firebase_service.update_accident_status(device_id, {"status": "confirmed_accident", "timestamp": now_iso()})
                 await iot_manager.save_snapshot(device_id)
                 if device_id in iot_manager.camera_sources:
                     await iot_manager.camera_sources[device_id].send_text("WAKE_UP")
+                # NEW: Send SOS command to related alert modules via Firebase
+                try:
+                    alert_modules = await _find_related_devices(device_id, DeviceType.ALERT_MODULE)
+                    for am_id in alert_modules:
+                        sos_cmd = {
+                            "command": "sos_on",
+                            "command_id": str(uuid.uuid4()),
+                            "status": "PENDING",
+                            "created_at": now_iso(),
+                            "received_at": None,
+                            "executed_at": None,
+                            "error": None,
+                        }
+                        await firebase_service.async_write_device_command(am_id, sos_cmd)
+                    # Write alert state for alert module consumption
+                    await firebase_service.async_update_alert_state(device_id, {
+                        "active": True, "alert_type": "accident",
+                        "message": "Confirmed accident detected",
+                        "timestamp": now_iso(), "alert_id": alert_id,
+                    })
+                    # Send snapshot command to related cameras
+                    cameras = await _find_related_devices(device_id, DeviceType.CAMERA)
+                    for cam_id in cameras:
+                        snap_cmd = {
+                            "command": "upload_snapshot",
+                            "command_id": str(uuid.uuid4()),
+                            "status": "PENDING",
+                            "created_at": now_iso(),
+                            "received_at": None,
+                            "executed_at": None,
+                            "error": None,
+                        }
+                        await firebase_service.async_write_device_command(cam_id, snap_cmd)
+                except Exception as e:
+                    logger.error(f"Error during CONFIRMED_ACCIDENT device updates: {e}")
+                # Broadcast to dashboard viewers
+                await iot_manager.broadcast_to_dashboard(device_id, "accident_status", {
+                    "status": "confirmed_accident", "device_id": device_id,
+                    "alert_id": alert_id,
+                })
             else:
                 # Buffer the normal telemetry data
                 iot_manager.add_telemetry(device_id, data)
                 try:
                     telemetry_dict = json.loads(data)
                     firebase_service.update_live_telemetry(device_id, telemetry_dict)
+                    # NEW: Update last_seen for online detection
+                    firebase_service.update_device_status(device_id, {"last_seen": now_iso(), "is_online": True})
+                    # Broadcast telemetry to dashboard viewers
+                    await iot_manager.broadcast_to_dashboard(device_id, "telemetry", telemetry_dict)
                 except Exception:
                     pass
     except WebSocketDisconnect:
         iot_manager.disconnect_device(device_id)
+        # Broadcast offline status to dashboard viewers
+        await iot_manager.broadcast_to_dashboard(device_id, "device_status", {
+            "is_online": False, "device_id": device_id, "last_seen": now_iso(),
+        })
 
 @app.websocket("/ws/camera/stream/{device_id}")
 async def ws_camera_stream(websocket: WebSocket, device_id: str):
@@ -524,6 +728,23 @@ async def ws_camera_view(websocket: WebSocket, device_id: str):
             await websocket.receive_text()
     except WebSocketDisconnect:
         iot_manager.disconnect_viewer(websocket, device_id)
+
+
+# ---- NEW: Dashboard WebSocket for web/mobile real-time updates ----
+@app.websocket("/ws/dashboard/{device_id}")
+async def ws_dashboard(websocket: WebSocket, device_id: str):
+    """Dashboard viewers receive typed JSON events:
+    telemetry, device_status, accident_status, alert_status,
+    command_status, camera_status.
+    """
+    await iot_manager.connect_dashboard_viewer(websocket, device_id)
+    try:
+        while True:
+            # Keep-alive — clients can send pings
+            await websocket.receive_text()
+    except WebSocketDisconnect:
+        iot_manager.disconnect_dashboard_viewer(websocket, device_id)
+
 
 app.add_middleware(GZipMiddleware, minimum_size=1000)
 app.add_middleware(
@@ -599,7 +820,15 @@ async def list_alerts(device_id: Optional[str] = None, limit: int = 50):
     q = {"device_id": device_id} if device_id else {}
     cursor = db.alerts.find(q).sort("created_at", -1).limit(limit)
     docs = await cursor.to_list(length=limit)
-    return [AlertRecord.from_mongo(d).model_dump() for d in docs]
+    results = []
+    for d in docs:
+        try:
+            results.append(AlertRecord.from_mongo(d).model_dump())
+        except Exception:
+            # Handle simplified alert docs from WebSocket handler
+            d["_id"] = str(d.get("_id", ""))
+            results.append(d)
+    return results
 
 
 @api.post("/alerts", status_code=status.HTTP_201_CREATED)
@@ -669,7 +898,26 @@ async def log_command(body: CommandIn):
     doc = CommandLog(**body.model_dump()).model_dump(exclude={"id"})
     result = await db.commands.insert_one(doc)
     doc["_id"] = str(result.inserted_id)
+    # Send via existing WebSocket + legacy Firebase emergency_commands
     await iot_manager.send_command(body.device_id, body.model_dump())
+    # NEW: Write structured command to Firebase for device consumption
+    firebase_cmd = {
+        "command": body.command,
+        "command_id": doc["command_id"],
+        "status": "PENDING",
+        "created_at": doc["created_at"],
+        "received_at": None,
+        "executed_at": None,
+        "error": None,
+    }
+    try:
+        await firebase_service.async_write_device_command(body.device_id, firebase_cmd)
+    except Exception as e:
+        logger.error(f"Failed to write command to Firebase: {e}")
+    # Broadcast command status to dashboard
+    await iot_manager.broadcast_to_dashboard(body.device_id, "command_status", {
+        "command": body.command, "command_id": doc["command_id"], "status": "PENDING",
+    })
     return CommandLog.from_mongo(doc).model_dump()
 
 
@@ -1251,6 +1499,267 @@ def _render_incident_pdf(alert, medical, contacts, trip):
     return buf.getvalue()
 
 
+
+# ---------------------------------------------------------------------------
+# Device Registration & Management  (NEW)
+# ---------------------------------------------------------------------------
+
+@api.post("/devices", status_code=status.HTTP_201_CREATED)
+async def register_device(body: DeviceRegister):
+    """Register a new physical device (Black Box, Alert Module, or Camera)."""
+    existing = await db.devices.find_one({"device_id": body.device_id})
+    if existing:
+        raise HTTPException(400, f"Device {body.device_id} already registered")
+    device = Device(**body.model_dump()).model_dump(exclude={"id"})
+    result = await db.devices.insert_one(device)
+    device["_id"] = str(result.inserted_id)
+    # Initialise Firebase status node for this device
+    try:
+        await firebase_service.async_update_device_status(body.device_id, {
+            "is_online": False,
+            "last_seen": None,
+            "device_id": body.device_id,
+            "device_type": body.device_type.value,
+        })
+    except Exception as e:
+        logger.error(f"Failed to init Firebase status for {body.device_id}: {e}")
+    return Device.from_mongo(device).model_dump()
+
+
+@api.get("/devices")
+async def list_devices(
+    device_type: Optional[str] = None,
+    vehicle_id: Optional[str] = None,
+    user_id: str = Depends(get_current_user),
+):
+    """List registered devices, optionally filtered by type or vehicle."""
+    q: dict = {}
+    if device_type:
+        q["device_type"] = device_type
+    if vehicle_id:
+        q["vehicle_id"] = vehicle_id
+    cursor = db.devices.find(q).sort("created_at", -1)
+    docs = await cursor.to_list(length=100)
+    return [Device.from_mongo(d).model_dump() for d in docs]
+
+
+@api.get("/devices/{device_id}")
+async def get_device(device_id: str):
+    """Get device details including computed online status."""
+    doc = await db.devices.find_one({"device_id": device_id})
+    if not doc:
+        raise HTTPException(404, f"Device {device_id} not found")
+    device = Device.from_mongo(doc).model_dump()
+    # Compute online status from last_seen
+    if device.get("last_seen"):
+        try:
+            last_seen_dt = datetime.fromisoformat(device["last_seen"])
+            delta = (datetime.now(timezone.utc) - last_seen_dt).total_seconds()
+            device["is_online"] = delta < DEVICE_ONLINE_TIMEOUT_SECONDS
+        except (ValueError, TypeError):
+            device["is_online"] = False
+    else:
+        device["is_online"] = False
+    return device
+
+
+@api.put("/devices/{device_id}")
+async def update_device(device_id: str, body: DeviceUpdate):
+    """Update device configuration (name, vehicle_id, enabled, etc.)."""
+    update_data = {k: v for k, v in body.model_dump().items() if v is not None}
+    if not update_data:
+        raise HTTPException(400, "No fields to update")
+    res = await db.devices.update_one({"device_id": device_id}, {"$set": update_data})
+    if res.matched_count == 0:
+        raise HTTPException(404, f"Device {device_id} not found")
+    doc = await db.devices.find_one({"device_id": device_id})
+    return Device.from_mongo(doc).model_dump()
+
+
+@api.delete("/devices/{device_id}")
+async def delete_device(device_id: str):
+    """Deregister a device."""
+    res = await db.devices.delete_one({"device_id": device_id})
+    if res.deleted_count == 0:
+        raise HTTPException(404, f"Device {device_id} not found")
+    return {"deleted": device_id}
+
+
+@api.get("/devices/{device_id}/status")
+async def get_device_status(device_id: str):
+    """Get real-time device status from Firebase + computed online state."""
+    fb_status = await firebase_service.async_read_device_status(device_id)
+    result = fb_status or {"is_online": False, "device_id": device_id}
+    # Compute online state from last_seen
+    last_seen = result.get("last_seen")
+    if last_seen:
+        try:
+            last_seen_dt = datetime.fromisoformat(last_seen)
+            delta = (datetime.now(timezone.utc) - last_seen_dt).total_seconds()
+            result["is_online"] = delta < DEVICE_ONLINE_TIMEOUT_SECONDS
+        except (ValueError, TypeError):
+            result["is_online"] = False
+    else:
+        result["is_online"] = False
+    return result
+
+
+# ---------------------------------------------------------------------------
+# Command Acknowledgement  (NEW)
+# ---------------------------------------------------------------------------
+
+@api.get("/commands/{command_id}/status")
+async def get_command_status(command_id: str):
+    """Get the current status of a command (from MongoDB + Firebase)."""
+    doc = await db.commands.find_one({"command_id": command_id})
+    if not doc:
+        raise HTTPException(404, f"Command {command_id} not found")
+    doc["_id"] = str(doc["_id"])
+    # Also check Firebase for latest ack if device_id is available
+    device_id = doc.get("device_id")
+    if device_id:
+        fb_cmd = await firebase_service.async_read_command_status(device_id)
+        if fb_cmd and fb_cmd.get("command_id") == command_id:
+            # Merge Firebase state into response
+            doc["firebase_status"] = fb_cmd.get("status")
+            doc["firebase_received_at"] = fb_cmd.get("received_at")
+            doc["firebase_executed_at"] = fb_cmd.get("executed_at")
+            doc["firebase_error"] = fb_cmd.get("error")
+    return doc
+
+
+@api.post("/commands/{command_id}/ack")
+async def ack_command(command_id: str, body: CommandAck):
+    """Device reports command acknowledgement (RECEIVED / EXECUTED / FAILED)."""
+    doc = await db.commands.find_one({"command_id": command_id})
+    if not doc:
+        raise HTTPException(404, f"Command {command_id} not found")
+
+    update_fields: dict = {"status": body.status}
+    if body.status == "RECEIVED":
+        update_fields["received_at"] = now_iso()
+    elif body.status == "EXECUTED":
+        update_fields["executed_at"] = now_iso()
+    elif body.status == "FAILED":
+        update_fields["error"] = body.error or "Unknown error"
+
+    await db.commands.update_one({"command_id": command_id}, {"$set": update_fields})
+
+    # Update Firebase command node
+    device_id = doc.get("device_id")
+    if device_id:
+        try:
+            await firebase_service.async_update_command_ack(device_id, update_fields)
+        except Exception as e:
+            logger.error(f"Failed to update Firebase command ack: {e}")
+        # Broadcast to dashboard
+        await iot_manager.broadcast_to_dashboard(device_id, "command_status", {
+            "command_id": command_id,
+            "command": doc.get("command"),
+            "status": body.status,
+            "error": body.error,
+        })
+
+    return {"command_id": command_id, "status": body.status}
+
+
+# ---------------------------------------------------------------------------
+# Camera Metadata  (NEW)
+# ---------------------------------------------------------------------------
+
+@api.post("/camera/{device_id}/metadata")
+async def update_camera_metadata(device_id: str, body: CameraMetadataIn):
+    """ESP32-CAM or admin reports camera metadata (stream URL, snapshot URL, online status)."""
+    update_data = {k: v for k, v in body.model_dump().items() if v is not None}
+    update_data["device_id"] = device_id
+    update_data["updated_at"] = now_iso()
+
+    await db.camera_metadata.update_one(
+        {"device_id": device_id},
+        {"$set": update_data},
+        upsert=True,
+    )
+    # Sync to Firebase
+    try:
+        await firebase_service.async_update_camera_metadata(device_id, update_data)
+    except Exception as e:
+        logger.error(f"Failed to sync camera metadata to Firebase: {e}")
+    # Broadcast to dashboard
+    await iot_manager.broadcast_to_dashboard(device_id, "camera_status", update_data)
+    return update_data
+
+
+@api.get("/camera/{device_id}/metadata")
+async def get_camera_metadata(device_id: str):
+    """Get camera metadata (stream URL, snapshot URL, online status)."""
+    # Try MongoDB first
+    doc = await db.camera_metadata.find_one({"device_id": device_id})
+    if doc:
+        doc.pop("_id", None)
+        return doc
+    # Fallback to Firebase
+    fb_cam = await firebase_service.async_read_camera_status(device_id)
+    if fb_cam:
+        return fb_cam
+    raise HTTPException(404, f"No camera metadata for device {device_id}")
+
+
+@api.get("/camera/{device_id}/status")
+async def get_camera_status_endpoint(device_id: str):
+    """Get camera online/offline status."""
+    fb_cam = await firebase_service.async_read_camera_status(device_id)
+    if fb_cam:
+        return {
+            "device_id": device_id,
+            "online": fb_cam.get("online", False),
+            "stream_url": fb_cam.get("stream_url"),
+            "snapshot_url": fb_cam.get("snapshot_url"),
+            "last_frame_at": fb_cam.get("last_frame_at"),
+            "updated_at": fb_cam.get("updated_at"),
+        }
+    # Fallback to MongoDB
+    doc = await db.camera_metadata.find_one({"device_id": device_id})
+    if doc:
+        doc.pop("_id", None)
+        return doc
+    return {"device_id": device_id, "online": False}
+
+
+# ---------------------------------------------------------------------------
+# Firebase telemetry read  (NEW — for when telemetry comes via Firebase, not WS)
+# ---------------------------------------------------------------------------
+
+@api.get("/devices/{device_id}/telemetry")
+async def get_device_telemetry(device_id: str):
+    """Read the latest telemetry for a device from Firebase.
+    Includes staleness detection based on timestamp.
+    """
+    telemetry = await firebase_service.async_read_device_telemetry(device_id)
+    if not telemetry:
+        raise HTTPException(404, f"No telemetry available for device {device_id}")
+    # Staleness detection
+    ts = telemetry.get("timestamp")
+    stale = True
+    if ts:
+        try:
+            ts_dt = datetime.fromisoformat(ts)
+            delta = (datetime.now(timezone.utc) - ts_dt).total_seconds()
+            stale = delta > 30
+        except (ValueError, TypeError):
+            stale = True
+    telemetry["stale"] = stale
+    return telemetry
+
+
+@api.get("/devices/{device_id}/accident")
+async def get_device_accident_status(device_id: str):
+    """Read the current accident status from Firebase."""
+    accident = await firebase_service.async_read_accident_status(device_id)
+    if not accident:
+        return {"device_id": device_id, "status": "normal"}
+    return accident
+
+
 app.include_router(api)
 
 
@@ -1339,9 +1848,39 @@ async def legacy_cancel_sos(body: LegacyCancelSOS):
         device_id=body.device_id,
         command="cancel_sos",
         payload={"source": "website"},
-        status="sent",
+        status="PENDING",
     ).model_dump(exclude={"id"})
     await db.commands.insert_one(doc)
+    # NEW: Update Firebase state to cancel SOS
+    try:
+        # Update accident status to normal
+        await firebase_service.async_update_accident_status(body.device_id, {
+            "status": "normal", "timestamp": now_iso(),
+        })
+        # Clear alert state
+        await firebase_service.async_update_alert_state(body.device_id, {
+            "active": False, "alert_type": None,
+            "message": "SOS cancelled", "timestamp": now_iso(), "alert_id": None,
+        })
+        # Send sos_off command to related alert modules
+        alert_modules = await _find_related_devices(body.device_id, DeviceType.ALERT_MODULE)
+        for am_id in alert_modules:
+            cancel_cmd = {
+                "command": "sos_off",
+                "command_id": str(uuid.uuid4()),
+                "status": "PENDING",
+                "created_at": now_iso(),
+                "received_at": None,
+                "executed_at": None,
+                "error": None,
+            }
+            await firebase_service.async_write_device_command(am_id, cancel_cmd)
+    except Exception as e:
+        logger.error(f"Failed to update Firebase on cancel-sos: {e}")
+    # Broadcast cancellation to dashboard
+    await iot_manager.broadcast_to_dashboard(body.device_id, "accident_status", {
+        "status": "sos_cancelled", "device_id": body.device_id,
+    })
     return {"status": "success", "message": f"SOS cancelled for {body.device_id}"}
 
 
