@@ -331,3 +331,96 @@ async def async_read_alert_state(device_id: str) -> Optional[dict]:
 
 def _now_iso() -> str:
     return datetime.now(timezone.utc).isoformat()
+
+
+# ---------------------------------------------------------------------------
+# REAL-TIME FIREBASE RTDB LISTENER & IN-MEMORY CACHE
+# ---------------------------------------------------------------------------
+
+_live_cache: dict = {}
+_listener_stream = None
+_broadcast_callback = None
+_async_loop = None
+
+
+def _on_firebase_event(event):
+    """Callback executed by Firebase Admin listener thread when RTDB changes."""
+    global _live_cache, _broadcast_callback, _async_loop
+    try:
+        path = getattr(event, "path", "/")
+        data = getattr(event, "data", None)
+        event_type = getattr(event, "event_type", "put")
+
+        data_str = json.dumps(data) if data is not None else "None"
+        if len(data_str) > 200:
+            data_str = data_str[:200] + "..."
+
+        logger.info(f"🔥 [FIREBASE RTDB RECEIVED] Event: {event_type.upper()} | Path: {path} | Data: {data_str}")
+
+        if path == "/" or not path or path == "":
+            if isinstance(data, dict):
+                _live_cache = data
+            elif data is None:
+                _live_cache = {}
+        else:
+            parts = [p for p in path.strip("/").split("/") if p]
+            curr = _live_cache
+            for part in parts[:-1]:
+                if part not in curr or not isinstance(curr[part], dict):
+                    curr[part] = {}
+                curr = curr[part]
+
+            if parts:
+                last_key = parts[-1]
+                if event_type == "patch" and isinstance(data, dict) and isinstance(curr.get(last_key), dict):
+                    curr[last_key].update(data)
+                elif data is None:
+                    curr.pop(last_key, None)
+                else:
+                    curr[last_key] = data
+
+        if _broadcast_callback and _async_loop and _async_loop.is_running():
+            logger.info(f"📡 [DISPATCHING TO FRONTEND] Forwarding path '{path}' to WebSocket broadcast callback...")
+            asyncio.run_coroutine_threadsafe(_broadcast_callback(path, data, _live_cache), _async_loop)
+        else:
+            logger.warning("⚠️ Broadcast callback or async loop not active — skipping WebSocket push.")
+    except Exception as e:
+        logger.error(f"Error processing Firebase RTDB listener event: {e}")
+
+
+
+def start_firebase_listener(loop=None, broadcast_callback=None):
+    """Start non-blocking real-time listener thread on Firebase RTDB 'devices' node."""
+    global _listener_stream, _broadcast_callback, _async_loop
+    init_firebase()
+    if not _firebase_initialized:
+        logger.warning("Cannot start Firebase listener: Firebase Admin SDK not initialized.")
+        return
+
+    _async_loop = loop
+    _broadcast_callback = broadcast_callback
+
+    try:
+        ref = db.reference("devices")
+        _listener_stream = ref.listen(_on_firebase_event)
+        logger.info("Firebase Realtime Database listener started on node 'devices'.")
+    except Exception as e:
+        logger.error(f"Failed to start Firebase RTDB listener: {e}")
+
+
+def stop_firebase_listener():
+    """Stop the Firebase RTDB listener stream."""
+    global _listener_stream
+    if _listener_stream:
+        try:
+            _listener_stream.close()
+            logger.info("Firebase Realtime Database listener stopped.")
+        except Exception as e:
+            logger.error(f"Error stopping Firebase listener: {e}")
+        _listener_stream = None
+
+
+def get_firebase_cache() -> dict:
+    """Return in-memory cache of live Firebase RTDB state."""
+    return _live_cache
+

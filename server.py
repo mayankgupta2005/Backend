@@ -118,17 +118,31 @@ def now_iso() -> str:
 # ---------------------------------------------------------------------------
 # Models
 # ---------------------------------------------------------------------------
+class UserRole(str, Enum):
+    RIDER = "RIDER"
+    FAMILY = "FAMILY"
+    POLICE = "POLICE"
+    ADMIN = "ADMIN"
+
+class UserStatus(str, Enum):
+    ACTIVE = "ACTIVE"
+    PENDING_APPROVAL = "PENDING_APPROVAL"
+    REJECTED = "REJECTED"
+
 class User(BaseDoc):
     user_id: str = Field(default_factory=lambda: str(uuid.uuid4()))
     email: str
     hashed_password: str
     name: str
+    role: UserRole = UserRole.RIDER
+    status: UserStatus = UserStatus.ACTIVE
     created_at: str = Field(default_factory=now_iso)
 
 class UserRegister(BaseModel):
     email: str
     password: str
     name: str
+    role: UserRole = UserRole.RIDER
 
 class UserLogin(BaseModel):
     email: str
@@ -139,6 +153,8 @@ class Token(BaseModel):
     token_type: str
     user_id: str
     name: str
+    role: str
+    status: str
 
 # ---- Security Utilities ----
 def verify_password(plain_password: str, hashed_password: str):
@@ -162,11 +178,22 @@ async def get_current_user(credentials: HTTPAuthorizationCredentials = Depends(s
     try:
         payload = jwt.decode(token, JWT_SECRET, algorithms=[ALGORITHM])
         user_id: str = payload.get("sub")
+        role: str = payload.get("role")
+        status: str = payload.get("status")
         if user_id is None:
             raise HTTPException(status_code=401, detail="Invalid token")
-        return user_id
+        return {"user_id": user_id, "role": role, "status": status}
     except jwt.PyJWTError:
         raise HTTPException(status_code=401, detail="Invalid or expired token")
+
+def require_role(*allowed_roles: str):
+    async def role_checker(current_user: dict = Depends(get_current_user)):
+        if current_user["status"] != UserStatus.ACTIVE.value:
+            raise HTTPException(status_code=403, detail="Account is not active (pending or rejected).")
+        if current_user["role"] not in allowed_roles:
+            raise HTTPException(status_code=403, detail=f"Operation not permitted for role {current_user['role']}")
+        return current_user
+    return role_checker
 
 class CameraCapture(BaseDoc):
     capture_id: str = Field(default_factory=lambda: str(uuid.uuid4()))
@@ -469,7 +496,14 @@ async def lifespan(app: FastAPI):
         await client.admin.command('ping')
     except Exception:
         raise RuntimeError("Could not connect to database")
+    
+    # Start Firebase RTDB background listener
+    loop = asyncio.get_running_loop()
+    firebase_service.start_firebase_listener(loop, iot_manager.broadcast_firebase_update)
+    
     yield
+    
+    firebase_service.stop_firebase_listener()
 
 app = FastAPI(title="NovaShields Mobile SOS Backend", version="1.0.0", lifespan=lifespan)
 api = APIRouter(prefix="/api")
@@ -480,6 +514,7 @@ class IoTConnectionManager:
         self.camera_viewers: dict[str, list[WebSocket]] = {}
         self.camera_sources: dict[str, WebSocket] = {}
         self.dashboard_viewers: dict[str, list[WebSocket]] = {}  # NEW: dashboard viewers per device
+        self.firebase_viewers: list[WebSocket] = []  # NEW: Firebase real-time viewers
         self.telemetry_buffer: dict[str, collections.deque] = {}
         self.video_buffer: dict[str, collections.deque] = {}
 
@@ -590,6 +625,41 @@ class IoTConnectionManager:
         for did in all_device_ids:
             await self.broadcast_to_dashboard(did, event_type, data)
 
+    # ---- NEW: Firebase Realtime Stream Viewers ----
+    async def connect_firebase_viewer(self, websocket: WebSocket):
+        await websocket.accept()
+        self.firebase_viewers.append(websocket)
+        client_ip = websocket.client.host if websocket.client else "unknown"
+        logger.info(f"🌐 [WEBSOCKET CONNECTED] Frontend client connected to /ws/firebase/live from {client_ip}. Active viewers: {len(self.firebase_viewers)}")
+
+    def disconnect_firebase_viewer(self, websocket: WebSocket):
+        if websocket in self.firebase_viewers:
+            self.firebase_viewers.remove(websocket)
+            logger.info(f"🔌 [WEBSOCKET DISCONNECTED] Frontend client disconnected. Active viewers remaining: {len(self.firebase_viewers)}")
+
+    async def broadcast_firebase_update(self, path: str, data: Any, full_cache: dict):
+        """Broadcast real-time Firebase RTDB change to all connected clients."""
+        message = {
+            "type": "firebase_update",
+            "path": path,
+            "data": data,
+            "full_cache": full_cache,
+            "timestamp": now_iso(),
+        }
+        num_viewers = len(self.firebase_viewers)
+        logger.info(f"⚡ [BROADCASTING TO FRONTEND] Pushing Firebase update on path '{path}' to {num_viewers} frontend client(s)")
+        dead_sockets = []
+        for viewer in list(self.firebase_viewers):
+            try:
+                await viewer.send_json(message)
+            except Exception as e:
+                logger.error(f"Failed to send WS message to viewer: {e}")
+                dead_sockets.append(viewer)
+        for dead in dead_sockets:
+            self.disconnect_firebase_viewer(dead)
+
+
+
 
 async def _find_related_devices(device_id: str, target_type: str) -> list[str]:
     """Find related devices (e.g. alert module for a given blackbox) by vehicle_id."""
@@ -695,6 +765,13 @@ async def ws_telemetry(websocket: WebSocket, device_id: str):
                 iot_manager.add_telemetry(device_id, data)
                 try:
                     telemetry_dict = json.loads(data)
+                    # Calculate g_force for dashboard consumption
+                    ax = telemetry_dict.get("ax", 0.0)
+                    ay = telemetry_dict.get("ay", 0.0)
+                    az = telemetry_dict.get("az", 1.0)
+                    g_force = (ax * ax + ay * ay + az * az) ** 0.5
+                    telemetry_dict["g_force"] = g_force
+                    
                     firebase_service.update_live_telemetry(device_id, telemetry_dict)
                     # NEW: Update last_seen for online detection
                     firebase_service.update_device_status(device_id, {"last_seen": now_iso(), "is_online": True})
@@ -730,20 +807,39 @@ async def ws_camera_view(websocket: WebSocket, device_id: str):
         iot_manager.disconnect_viewer(websocket, device_id)
 
 
-# ---- NEW: Dashboard WebSocket for web/mobile real-time updates ----
+# ---- NEW: Dashboard WebSocket Endpoint ----
 @app.websocket("/ws/dashboard/{device_id}")
 async def ws_dashboard(websocket: WebSocket, device_id: str):
-    """Dashboard viewers receive typed JSON events:
-    telemetry, device_status, accident_status, alert_status,
-    command_status, camera_status.
-    """
+    """Live WebSocket stream of telemetry, commands, and alerts specifically for the frontend dashboard."""
     await iot_manager.connect_dashboard_viewer(websocket, device_id)
     try:
+        # Send an initial ping or status
+        await iot_manager.broadcast_to_dashboard(device_id, "device_status", {
+            "is_online": device_id in iot_manager.active_devices,
+            "device_id": device_id,
+        })
         while True:
-            # Keep-alive — clients can send pings
             await websocket.receive_text()
     except WebSocketDisconnect:
         iot_manager.disconnect_dashboard_viewer(websocket, device_id)
+
+
+# ---- NEW: Firebase Realtime Database Stream WebSocket ----
+@app.websocket("/ws/firebase/live")
+async def ws_firebase_live(websocket: WebSocket):
+    """Live WebSocket stream of Firebase RTDB changes across all devices."""
+    await iot_manager.connect_firebase_viewer(websocket)
+    try:
+        # Send initial cache snapshot
+        await websocket.send_json({
+            "type": "firebase_snapshot",
+            "full_cache": firebase_service.get_firebase_cache(),
+            "timestamp": now_iso(),
+        })
+        while True:
+            await websocket.receive_text()
+    except WebSocketDisconnect:
+        iot_manager.disconnect_firebase_viewer(websocket)
 
 
 app.add_middleware(GZipMiddleware, minimum_size=1000)
@@ -761,6 +857,41 @@ async def health():
     return {"status": "online", "service": "NovaShields Mobile SOS", "time": now_iso()}
 
 
+# ---- REALTIME FIREBASE ENDPOINTS ----
+@api.get("/firebase/live")
+async def get_firebase_live_data():
+    """Get snapshot of current live Firebase cache."""
+    cache = firebase_service.get_firebase_cache()
+    return {"status": "success", "cache": cache, "timestamp": now_iso()}
+
+
+@api.get("/firebase/live/{device_id}")
+async def get_firebase_device_data(device_id: str):
+    """Get live Firebase data for specific device_id."""
+    cache = firebase_service.get_firebase_cache()
+    device_data = cache.get(device_id)
+    if not device_data:
+        device_data = await firebase_service.async_read_camera_status(device_id)
+    return {"status": "success", "device_id": device_id, "data": device_data, "timestamp": now_iso()}
+
+
+@api.post("/simulator/firebase_camera")
+async def simulate_firebase_camera_update(payload: dict):
+    """Simulator endpoint to test writing camera metadata to Firebase RTDB."""
+    device_id = payload.get("device_id", "6a784b5a2d5c723280f9a163")
+    camera_data = {
+        "device_id": device_id,
+        "online": payload.get("online", True),
+        "snapshot_url": payload.get("snapshot_url", "https://res.cloudinary.com/p0pwhnui/image/upload/v1786267512/cspc.jpg"),
+        "stream_url": payload.get("stream_url", ""),
+        "last_frame_at": payload.get("last_frame_at", now_iso()),
+        "updated_at": now_iso(),
+    }
+    await firebase_service.async_update_camera_metadata(device_id, camera_data)
+    return {"message": "Camera metadata updated in Firebase RTDB", "data": camera_data}
+
+
+
 # ---- Auth Endpoints -------------------------------------------------------
 @api.post("/auth/register")
 async def register(user_in: UserRegister):
@@ -769,13 +900,27 @@ async def register(user_in: UserRegister):
         raise HTTPException(status_code=400, detail="Email already registered")
     
     hashed_password = get_password_hash(user_in.password)
+    
+    # Auto-approve RIDER/FAMILY, set POLICE/ADMIN to PENDING_APPROVAL
+    status = UserStatus.ACTIVE
+    if user_in.role in [UserRole.POLICE, UserRole.ADMIN]:
+        status = UserStatus.PENDING_APPROVAL
+        
+    # Bootstrap: if this is an ADMIN, and there are NO users in the DB yet, auto-approve
+    if user_in.role == UserRole.ADMIN:
+        count = await db.users.count_documents({})
+        if count == 0:
+            status = UserStatus.ACTIVE
+            
     new_user = User(
         email=user_in.email,
         hashed_password=hashed_password,
-        name=user_in.name
+        name=user_in.name,
+        role=user_in.role,
+        status=status
     )
     result = await db.users.insert_one(new_user.model_dump(exclude={"id"}))
-    return {"message": "User registered successfully", "user_id": str(result.inserted_id)}
+    return {"message": "User registered successfully", "user_id": str(result.inserted_id), "status": status.value}
 
 @api.post("/auth/login")
 async def login(user_in: UserLogin):
@@ -783,11 +928,29 @@ async def login(user_in: UserLogin):
     if not user or not verify_password(user_in.password, user["hashed_password"]):
         raise HTTPException(status_code=401, detail="Incorrect email or password")
     
+    # Check approval status
+    if user.get("status") == UserStatus.PENDING_APPROVAL.value:
+        raise HTTPException(status_code=403, detail="Account pending admin approval.")
+    if user.get("status") == UserStatus.REJECTED.value:
+        raise HTTPException(status_code=403, detail="Account rejected by admin.")
+    
     access_token_expires = timedelta(minutes=ACCESS_TOKEN_EXPIRE_MINUTES)
     access_token = create_access_token(
-        data={"sub": user["user_id"]}, expires_delta=access_token_expires
+        data={
+            "sub": user["user_id"],
+            "role": user.get("role", UserRole.RIDER.value),
+            "status": user.get("status", UserStatus.ACTIVE.value)
+        }, 
+        expires_delta=access_token_expires
     )
-    return {"access_token": access_token, "token_type": "bearer", "user_id": user["user_id"], "name": user["name"]}
+    return {
+        "access_token": access_token, 
+        "token_type": "bearer", 
+        "user_id": user["user_id"], 
+        "name": user["name"],
+        "role": user.get("role", UserRole.RIDER.value),
+        "status": user.get("status", UserStatus.ACTIVE.value)
+    }
 
 
 # ---- Emergency Contacts CRUD ----------------------------------------------
@@ -870,7 +1033,7 @@ async def upload_camera_image(device_id: str = "device_001", file: UploadFile = 
 
 
 @api.get("/camera/latest/{device_id}")
-async def get_latest_image(device_id: str):
+async def get_latest_image(device_id: str, _ = Depends(require_role("POLICE", "ADMIN"))):
     capture = await db.camera_captures.find_one(
         {"device_id": device_id},
         sort=[("created_at", -1)]
@@ -886,7 +1049,7 @@ async def get_latest_image(device_id: str):
 
 # ---- Command Log ----------------------------------------------------------
 @api.get("/commands")
-async def list_commands(device_id: Optional[str] = None, limit: int = 50):
+async def list_commands(device_id: Optional[str] = None, limit: int = 50, _ = Depends(require_role("ADMIN", "POLICE"))):
     q = {"device_id": device_id} if device_id else {}
     cursor = db.commands.find(q).sort("created_at", -1).limit(limit)
     docs = await cursor.to_list(length=limit)
@@ -894,7 +1057,7 @@ async def list_commands(device_id: Optional[str] = None, limit: int = 50):
 
 
 @api.post("/commands", status_code=status.HTTP_201_CREATED)
-async def log_command(body: CommandIn):
+async def log_command(body: CommandIn, _ = Depends(require_role("RIDER", "FAMILY", "POLICE", "ADMIN"))):
     doc = CommandLog(**body.model_dump()).model_dump(exclude={"id"})
     result = await db.commands.insert_one(doc)
     doc["_id"] = str(result.inserted_id)
@@ -1887,6 +2050,40 @@ async def legacy_cancel_sos(body: LegacyCancelSOS):
 # ---------------------------------------------------------------------------
 
 
+
+# ---- Admin User Management --------------------------------------------------
+@api.get("/admin/users")
+async def list_users(status: Optional[str] = None, _ = Depends(require_role("ADMIN"))):
+    q = {}
+    if status:
+        q["status"] = status
+    cursor = db.users.find(q).sort("created_at", -1)
+    docs = await cursor.to_list(length=100)
+    # Filter out hashed_password for safety
+    for d in docs:
+        d.pop("hashed_password", None)
+        d["_id"] = str(d["_id"])
+    return docs
+
+@api.patch("/admin/users/{user_id}/approve")
+async def approve_user(user_id: str, _ = Depends(require_role("ADMIN"))):
+    result = await db.users.update_one(
+        {"_id": ObjectId(user_id)}, 
+        {"$set": {"status": UserStatus.ACTIVE.value}}
+    )
+    if result.modified_count == 0:
+        raise HTTPException(status_code=404, detail="User not found or already active")
+    return {"status": "success", "message": f"User {user_id} approved."}
+
+@api.patch("/admin/users/{user_id}/reject")
+async def reject_user(user_id: str, _ = Depends(require_role("ADMIN"))):
+    result = await db.users.update_one(
+        {"_id": ObjectId(user_id)}, 
+        {"$set": {"status": UserStatus.REJECTED.value}}
+    )
+    if result.modified_count == 0:
+        raise HTTPException(status_code=404, detail="User not found or already rejected")
+    return {"status": "success", "message": f"User {user_id} rejected."}
 
 @app.get("/")
 async def root():
